@@ -9,10 +9,10 @@ import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.io.File;
-import java.io.FileWriter;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+
+import org.example.slicer.SlicedModelBuilder;
 
 public class SpoonAnalyzer {
 
@@ -52,6 +52,7 @@ public class SpoonAnalyzer {
                     if (method.getSimpleName().equals(methodName)) {
                         return method;
                     }
+
                 }
             }
         }
@@ -59,16 +60,52 @@ public class SpoonAnalyzer {
     }
 
 
-
-
     public Set<CtElement> collectResolvedDependencies(CtMethod<?> method) {
         Set<CtElement> dependencies = new HashSet<>();
+        SlicedModelBuilder.setTrueTargetMethod(method);
+        if (SlicedModelBuilder.leanMode && !isTargetMethod(method)) {
+            dependencies.add(method);
+            dependencies.add(method.getType());
+
+            for (CtParameter<?> param : method.getParameters()) {
+                dependencies.add(param);
+                dependencies.add(param.getType());
+            }
+
+            for (CtTypeReference<?> thrown : method.getThrownTypes()) {
+                dependencies.add(thrown);
+            }
+
+            CtType<?> type = method.getDeclaringType();
+            if (type != null) {
+                dependencies.add(type);
+                dependencies.add(type.getReference());
+
+                // optional: add interface and superclass
+                if (type.getSuperclass() != null) {
+                    dependencies.add(type.getSuperclass());
+                }
+                dependencies.addAll(type.getSuperInterfaces());
+            }
+
+            return dependencies;
+        }
+
 
         // ✅ Method invocations
         for (CtInvocation<?> invocation : method.getElements(new TypeFilter<>(CtInvocation.class))) {
             dependencies.add(invocation);
             CtExecutable<?> resolved = invocation.getExecutable().getDeclaration();
             if (resolved != null) dependencies.add(resolved);
+            if (resolved instanceof CtMethod) {
+                CtType<?> declaringType = ((CtMethod<?>) resolved).getDeclaringType();
+                if (declaringType != null) dependencies.add(declaringType);
+            }
+            if (resolved instanceof CtConstructor) {
+                CtType<?> declaringType = ((CtConstructor<?>) resolved).getDeclaringType();
+                if (declaringType != null) dependencies.add(declaringType);
+            }
+
         }
 
         // ✅ Constructor calls
@@ -76,7 +113,16 @@ public class SpoonAnalyzer {
             dependencies.add(ctor);
             CtExecutable<?> resolved = ctor.getExecutable().getDeclaration();
             if (resolved != null) dependencies.add(resolved);
+            CtTypeReference<?> typeRef = ctor.getType();
+            if (typeRef != null && typeRef.getDeclaration() != null) {
+                dependencies.add(typeRef.getDeclaration());
+            }
+            for (CtExpression<?> arg : ctor.getArguments()) {
+                dependencies.addAll(arg.getElements(new TypeFilter<>(CtElement.class)));
+            }
+
         }
+
 
         // ✅ Field reads and writes (incl. static fields)
         for (CtFieldAccess<?> field : method.getElements(new TypeFilter<>(CtFieldAccess.class))) {
@@ -88,13 +134,21 @@ public class SpoonAnalyzer {
         // ✅ Return + parameter types
         dependencies.add(method.getType());
         for (CtParameter<?> param : method.getParameters()) {
-            dependencies.add(param.getType());
+            boolean isUsed = method.getElements(new TypeFilter<>(CtVariableRead.class)).stream()
+                    .anyMatch(read -> read.getVariable().equals(param.getReference()));
+            if (isUsed) {
+                dependencies.add(param);
+                dependencies.add(param.getType());
+            }
         }
 
+
         // ✅ Thrown exceptions
-        for (CtTypeReference<?> thrown : method.getThrownTypes()) {
-            dependencies.add(thrown); // keep unresolved too
+        for (CtThrow thrownStmt : method.getElements(new TypeFilter<>(CtThrow.class))) {
+            CtExpression<?> thrownExpr = thrownStmt.getThrownExpression();
+            if (thrownExpr != null) dependencies.add(thrownExpr.getType());
         }
+
 
         // ✅ Annotations
         for (CtAnnotation<?> annotation : method.getAnnotations()) {
@@ -132,7 +186,7 @@ public class SpoonAnalyzer {
         // ✅ Add all fields, methods, constructors of the declaring class
         if (declaringType != null) {
             dependencies.addAll(declaringType.getFields());
-         //   dependencies.addAll(declaringType.getMethods());
+            //   dependencies.addAll(declaringType.getMethods());
             if (declaringType instanceof CtClass<?>) {
                 dependencies.addAll(((CtClass<?>) declaringType).getConstructors());
             }
@@ -148,6 +202,18 @@ public class SpoonAnalyzer {
 
         }
 
+        // ✅ Static final fields
+        if (declaringType != null) {
+            for (CtField<?> field : declaringType.getFields()) {
+                if (field.hasModifier(ModifierKind.STATIC) && field.hasModifier(ModifierKind.FINAL)) {
+                    dependencies.add(field);
+                    if (field.getAssignment() != null) {
+                        dependencies.add(field.getAssignment());
+                    }
+                }
+            }
+        }
+
         for (CtFieldReference<?> fieldRef : method.getElements(new TypeFilter<>(CtFieldReference.class))) {
             if (fieldRef.getDeclaration() != null) {
                 dependencies.add(fieldRef.getDeclaration());
@@ -157,7 +223,6 @@ public class SpoonAnalyzer {
         dependencies.removeIf(dep -> dep instanceof CtTypeReference && (
                 ((CtTypeReference<?>) dep).getQualifiedName().startsWith("java.")
         ));
-
 
 
         return dependencies;
@@ -202,6 +267,12 @@ public class SpoonAnalyzer {
      */
     public void printSlicedModel() {
         launcher.prettyprint();
+    }
+
+
+    private boolean isTargetMethod(CtMethod<?> method) {
+        return method.getSimpleName().equals("main")
+                || method.hasModifier(ModifierKind.PUBLIC);
     }
 
 

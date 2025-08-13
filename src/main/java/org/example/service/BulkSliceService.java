@@ -5,6 +5,9 @@ import org.example.compiler.JavaCompilerService;
 import org.example.slicer.SlicedModelBuilder;
 import spoon.reflect.declaration.*;
 
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
 import java.time.LocalTime;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -14,13 +17,15 @@ public class BulkSliceService {
     private final List<String> passed = new ArrayList<>();
     private final Map<String, Exception> failed = new LinkedHashMap<>();
     private final List<String> totalmethod = new ArrayList<>();
+    private static final String LOG_FILE_PATH = "/Users/mitul/Documents/study/Thesis/partial compilation/debug/slicing_failures_log.txt";
 
     public void runFullAnalysis(String srcPath) {
         System.out.println("📁 Starting full analysis on: " + srcPath);
 
         // Step 1: Load model ONCE to extract all method identifiers
-        SpoonAnalyzer baseAnalyzer = new SpoonAnalyzer(srcPath);
 
+        SpoonAnalyzer baseAnalyzer = new SpoonAnalyzer(srcPath);
+        SlicedModelBuilder.leanMode = true;
         List<Map.Entry<String, String>> methods = new ArrayList<>();
         for (CtType<?> type : baseAnalyzer.getModel().getAllTypes()) {
             String className = type.getQualifiedName();
@@ -34,26 +39,26 @@ public class BulkSliceService {
             String className = entry.getKey();
             String methodName = entry.getValue();
             String methodId = className + "#" + methodName;
-            totalmethod.add(methodId);
+
 
             try {
 
-                System.out.println("start time in ms: " + LocalTime.now());
+                //System.out.println("start time in ms: " + LocalTime.now());
 
                 SpoonAnalyzer analyzer = new SpoonAnalyzer(srcPath); // new model per method
 
                 Map<String, List<String>> target = Map.of(className, List.of(methodName));
                 Set<CtElement> deps = analyzer.findAndCollectMultipleTargets(target);
 
-                System.out.println("after dependencies time in ms: " + LocalTime.now());
+               // System.out.println("after dependencies time in ms: " + LocalTime.now());
                 SlicedModelBuilder slicer = new SlicedModelBuilder(analyzer.getModel(), deps);
-
+                totalmethod.add(methodId);
                 try {
                     slicer.slice();
-                    System.out.println("after slicing time in ms: " + LocalTime.now());
+                  //  System.out.println("after slicing time in ms: " + LocalTime.now());
                 } catch (Exception sliceEx) {
                     failed.put(methodId, new RuntimeException("Slicing error", sliceEx));
-                    System.err.println("❌ Slicing failed for " + methodId + ": " + sliceEx);
+                 //   System.err.println("❌ Slicing failed for " + methodId + ": " + sliceEx);
                     sliceEx.printStackTrace(System.err);
                     continue;
                 }
@@ -62,10 +67,10 @@ public class BulkSliceService {
                 boolean compiled;
                 try {
                     compiled = compiler.compileSlicedAnalyzer(analyzer);
-                    System.out.println("after compilation time in ms: " + LocalTime.now());
+                 //   System.out.println("after compilation time in ms: " + LocalTime.now());
                 } catch (Exception compEx) {
                     failed.put(methodId, new RuntimeException("Compilation error", compEx));
-                    System.err.println("❌ Compilation crashed for " + methodId + ": " + compEx);
+                   // System.err.println("❌ Compilation crashed for " + methodId + ": " + compEx);
                     compEx.printStackTrace(System.err);
                     continue;
                 }
@@ -73,20 +78,37 @@ public class BulkSliceService {
                 if (compiled) {
                     passed.add(methodId);
                 } else {
+                    System.err.println("❌ Compilation crashed for " + methodId + ": ");
+                    log(methodId + "❌ Compilation crashed for " + methodId);
                     System.out.println("🔎 Keeping elements:");
+                    log(methodId + "🔎 Keeping elements:");
+
+                    deps.forEach(e -> log( " - " + e.getClass().getSimpleName() + ": " + e.toString()));
                     deps.forEach(e -> System.out.println("  - " + e.getClass().getSimpleName() + ": " + e.toString()));
+
                     for (CtType<?> type : slicer.model.getAllTypes()) {
                         System.out.println("Kept class: " + type.getQualifiedName());
                         System.out.println("  Kept methods: " + type.getMethods().stream().filter(slicer.toKeep::contains).collect(Collectors.toList()));
                         System.out.println("  Kept fields: " + type.getFields().stream().filter(slicer.toKeep::contains).collect(Collectors.toList()));
+                        log( "Kept class: " + type.getQualifiedName());
+                        log( "  Kept methods: " + type.getMethods().stream()
+                                .filter(slicer.toKeep::contains)
+                                .collect(Collectors.toList()).toString());
+                        log("  Kept fields: " + type.getFields().stream()
+                                .filter(slicer.toKeep::contains)
+                                .collect(Collectors.toList()).toString());
                     }
-                    //analyzer.printSlicedModel();
-                    System.err.println("❌ Compilation crashed for " + methodId + ": ");
+                   // analyzer.printSlicedModel();
+
                     failed.put(methodId, new RuntimeException("Compilation failed (did not crash)"));
-                    System.out.println("=== TOTAL METHOD === " + gettotalMethods().size());
+
+                   System.out.println("=== TOTAL METHOD === " + gettotalMethods().size());
                     System.out.println("=== PASS === " + getPassedMethods().size());
-                    System.out.println("=== FAIL === " + getFailedMethodsWithErrors().size());
-                    continue;
+                   System.out.println("=== FAIL === " + getFailedMethodsWithErrors().size());
+                    log( "=== TOTAL METHOD === " + gettotalMethods().size());
+                    log( "=== PASS === " + getPassedMethods().size());
+                    log( "=== FAIL === " + getFailedMethodsWithErrors().size());
+                   continue;
                 }
 
             } catch (Exception ex) {
@@ -97,7 +119,7 @@ public class BulkSliceService {
             // Print status after each
             System.out.println("=== TOTAL METHOD === " + gettotalMethods().size());
             System.out.println("=== PASS === " + getPassedMethods().size());
-            System.out.println("=== FAIL === " + getFailedMethodsWithErrors().size());
+           System.out.println("=== FAIL === " + getFailedMethodsWithErrors().size());
         }
 
         Set<String> missing = new HashSet<>(totalmethod);
@@ -128,5 +150,15 @@ public class BulkSliceService {
 
     public boolean hasFailures() {
         return !failed.isEmpty();
+    }
+
+
+    public static void log(String message) {
+        try (FileWriter fw = new FileWriter(LOG_FILE_PATH, true);
+             PrintWriter out = new PrintWriter(fw)) {
+            out.println(message);
+        } catch (IOException e) {
+            System.err.println("Error writing log: " + e.getMessage());
+        }
     }
 }

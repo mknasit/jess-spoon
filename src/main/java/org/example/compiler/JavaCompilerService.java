@@ -1,6 +1,7 @@
 package org.example.compiler;
 
 import org.example.analyzer.SpoonAnalyzer;
+import org.example.service.BulkSliceService;
 import spoon.reflect.declaration.CtType;
 
 import javax.tools.*;
@@ -12,6 +13,7 @@ import java.util.*;
 import spoon.reflect.reference.CtReference;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.DefaultJavaPrettyPrinter;
+
 public class JavaCompilerService {
 
     public boolean compileSlicedAnalyzer(SpoonAnalyzer analyzer) {
@@ -44,7 +46,7 @@ public class JavaCompilerService {
 
         // Step 4: Print result
         if (success) {
-            System.out.println("✅ Compilation succeeded.");
+          //  System.out.println("✅ Compilation succeeded.");
         } else {
             System.out.println("❌ Compilation failed.");
         }
@@ -52,50 +54,6 @@ public class JavaCompilerService {
         return success;
     }
 
-    private void exportSlicedSourcesold(SpoonAnalyzer analyzer, File targetDir) {
-        if (!targetDir.exists()) {
-            targetDir.mkdirs();
-        }
-
-        for (CtType<?> type : analyzer.getModel().getAllTypes()) {
-            String code = type.toString();
-            String fileName = type.getSimpleName() + ".java";
-
-            File outputFile = new File(targetDir, fileName);
-            try (FileWriter writer = new FileWriter(outputFile, StandardCharsets.UTF_8)) {
-                writer.write(code);
-            } catch (IOException e) {
-               // System.err.println("❌ Error writing: " + outputFile.getName());
-                e.printStackTrace();
-            }
-        }
-    }
-
-    private void exportSlicedSourcesold2(SpoonAnalyzer analyzer, File targetDir) {
-        if (!targetDir.exists()) {
-            targetDir.mkdirs();
-        }
-
-        for (CtType<?> type : analyzer.getModel().getAllTypes()) {
-
-            DefaultJavaPrettyPrinter printer = new DefaultJavaPrettyPrinter(analyzer.getLauncher().getEnvironment());
-            printer.calculate(type.getPosition().getCompilationUnit(), Collections.singletonList(type));
-            String code = printer.getResult();
-
-            // Optional: patch known enum constants to fully-qualified names
-            code = code.replace("RetentionPolicy.RUNTIME", "java.lang.annotation.RetentionPolicy.RUNTIME");
-            code = code.replace("ElementType.FIELD", "java.lang.annotation.ElementType.FIELD");
-            code = code.replace("ThreadFactory", "java.util.concurrent.ThreadFactory"); // and so on
-
-            File outputFile = new File(targetDir, type.getSimpleName() + ".java");
-            try (FileWriter writer = new FileWriter(outputFile, StandardCharsets.UTF_8)) {
-                writer.write(code);
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-
-    }
 
     private void exportSlicedSources(SpoonAnalyzer analyzer, File targetDir) {
         if (!targetDir.exists()) {
@@ -132,8 +90,6 @@ public class JavaCompilerService {
     }
 
 
-
-
     private boolean compileFromSourceold(File sourceDir, File outputDir) {
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         if (compiler == null) {
@@ -147,8 +103,8 @@ public class JavaCompilerService {
             return false;
         }
 
-       // System.out.println("🛠️ Compiling sliced source files:");
-       // javaFiles.forEach(file -> System.out.println(" - " + file.getName()));
+        // System.out.println("🛠️ Compiling sliced source files:");
+        // javaFiles.forEach(file -> System.out.println(" - " + file.getName()));
 
         try (StandardJavaFileManager fileManager = compiler.getStandardFileManager(null, Locale.getDefault(), StandardCharsets.UTF_8)) {
             Iterable<? extends JavaFileObject> sources = fileManager.getJavaFileObjectsFromFiles(javaFiles);
@@ -182,14 +138,15 @@ public class JavaCompilerService {
             if (!result) {
                 System.err.println("Compilation errors:");
                 for (Diagnostic<? extends JavaFileObject> diag : diagnostics.getDiagnostics()) {
-                    System.err.println(diag);
+                     System.err.println(diag);
+                    BulkSliceService.log("Compilation errors:"+diag);
                 }
             }
 
             return result;
         } catch (Exception e) {
             e.printStackTrace();
-            System.out.println("CopilaionFailed because "+e.getMessage());
+            System.out.println("CopilaionFailed because " + e.getMessage());
             return false;
         }
     }

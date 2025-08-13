@@ -10,7 +10,8 @@ public class Worker implements MyInterface {
        // Util.help();      // external class
         System.out.println("Status: " + status);
        Helper helpertest = new Helper();  // ✅ use nested class
-        helpertest.run();
+        int a = helpertest.run();
+        System.out.println("value: " + a);
        // throw new MyException("fail");
     }
 

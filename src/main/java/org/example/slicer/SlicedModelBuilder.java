@@ -8,9 +8,7 @@ import spoon.reflect.reference.CtFieldReference;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.ImportCleaner;
 import spoon.reflect.visitor.filter.TypeFilter;
-import spoon.reflect.cu.SourcePosition;
 import spoon.reflect.declaration.CtTypeMember;
-;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -19,6 +17,8 @@ public class SlicedModelBuilder {
     public final CtModel model;
     public final Set<CtElement> toKeep;
     private final Set<String> unresolvedTypes = new HashSet<>();
+    public static boolean leanMode = false;
+    public static CtMethod<?> trueTargetMethod = null;
 
     public SlicedModelBuilder(CtModel model, Set<CtElement> dependencies) {
         this.model = model;
@@ -26,18 +26,60 @@ public class SlicedModelBuilder {
     }
 
     public void slice() {
-        expandTransitiveTypeReferences();
-        expandFieldDependencies();
-        expandInvokedMethodDependencies();
-        expandMethodBodyDependencies();
+        if (!leanMode) {
+            expandTransitiveTypeReferences();
+            expandFieldDependencies();
+            expandInvokedMethodDependencies();
+            expandMethodBodyDependencies();
+        }
+        else {
+            expandMinimalDependencies();  // 🔥 NEW
+        }
+
+        for (CtElement el : toKeep) {
+            if (el instanceof CtAnonymousExecutable) {
+                CtAnonymousExecutable block = (CtAnonymousExecutable) el;
+
+                for (CtAssignment assign : block.getElements(new TypeFilter<>(CtAssignment.class))) {
+                    CtExpression<?> lhs = assign.getAssigned();
+
+                    if (lhs instanceof CtFieldAccess<?>) {
+                        CtFieldAccess<?> fieldAccess = (CtFieldAccess<?>) lhs;
+                        CtFieldReference<?> ref = fieldAccess.getVariable();
+
+                        if (ref != null && ref.isFinal() && ref.isStatic()) {
+                            CtField<?> field = ref.getDeclaration();
+
+                            // Only rewrite if target is a qualified type access
+                            if (fieldAccess.getTarget() instanceof CtTypeAccess<?>) {
+                                CtTypeAccess<?> target = (CtTypeAccess<?>) fieldAccess.getTarget();
+                                if (field != null &&
+                                        target.getAccessedType().getQualifiedName().equals(field.getDeclaringType().getQualifiedName())) {
+
+                                    // ✅ Replace with simple field read: STANDARD_CHARSET_MAP = ...
+                                    CtFieldRead<?> newLhs = (CtFieldRead<?>) field.getFactory().Code().createVariableRead(ref, true);
+                                    assign.setAssigned(newLhs);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
 
         // 🔒 Filter out elements with unresolved or missing declarations
         toKeep.removeIf(el -> {
             if (el instanceof CtTypeReference<?>) {
                 CtTypeReference<?> ref = (CtTypeReference<?>) el;
                 CtType<?> decl = ref.getDeclaration();
-                return decl == null || decl.getPosition() == null || decl.getPosition() instanceof spoon.reflect.cu.position.NoSourcePosition;
+                // ⚠️ Allow generics, allow unresolved java.* types
+                if (decl == null && !ref.getQualifiedName().matches("^[A-Z]$")) {
+                    return true;
+                }
+                return decl != null && decl.getPosition() instanceof spoon.reflect.cu.position.NoSourcePosition;
             }
+
             if (el instanceof CtExecutableReference<?>) {
                 CtExecutableReference<?> ref = (CtExecutableReference<?>) el;
                 CtExecutable<?> decl = ref.getDeclaration();
@@ -72,8 +114,6 @@ public class SlicedModelBuilder {
         });
 
 
-
-
         for (CtType<?> type : model.getAllTypes()) {
             //System.out.println("Kept class: " + type.getQualifiedName());
             //System.out.println("  Kept methods: " + type.getMethods().stream().filter(toKeep::contains).collect(Collectors.toList()));
@@ -105,10 +145,88 @@ public class SlicedModelBuilder {
             return false;
         });
 
+
         for (CtType<?> type : model.getAllTypes()) {
             ImportCleaner cleaner = new ImportCleaner();
-           cleaner.process(type);
+            cleaner.process(type);
         }
+
+        // 🔧 Ensure all kept classes have required method implementations
+        for (CtType<?> type : model.getAllTypes()) {
+            if (!(type instanceof CtClass)) continue;
+
+            CtClass<?> clazz = (CtClass<?>) type;
+
+            List<CtMethod<?>> missing = getUnimplementedAbstractMethods(clazz);
+            if (missing.isEmpty()) continue;
+
+            if (!isInstantiated(clazz)) {
+                if (clazz.hasModifier(ModifierKind.FINAL)) {
+                  //  System.out.println("⚠️ Removing final from class to allow abstract: " + clazz.getQualifiedName());
+                    clazz.removeModifier(ModifierKind.FINAL);
+                }
+                clazz.addModifier(ModifierKind.ABSTRACT);
+               // System.out.println("🔧 Marked class abstract (not instantiated): " + clazz.getQualifiedName());
+            } else {
+                for (CtMethod<?> abstractMethod : missing) {
+                    CtMethod<?> stub = abstractMethod.clone();
+                    stub.removeModifier(ModifierKind.ABSTRACT);
+                    stub.setBody(createStubBody(clazz, stub.getType()));
+                    stub.setVisibility(ModifierKind.PUBLIC); // Ensure correct visibility
+                    clazz.addMethod(stub);
+                    //System.out.println("🧪 Stubbed abstract method: " + stub.getSignature() + " in " + clazz.getQualifiedName());
+                }
+            }
+        }
+
+        List<CtField<?>> removableFields = new ArrayList<>();
+        for (CtElement el : toKeep) {
+            if (el instanceof CtField<?>) {
+                CtField<?> field = (CtField<?>) el;
+                boolean isStaticFinal = field.hasModifier(ModifierKind.STATIC) && field.hasModifier(ModifierKind.FINAL);
+                if (isStaticFinal && field.getAssignment() == null) {
+                    removableFields.add(field);
+                }
+            }
+        }
+
+// Safely remove fields from both model and toKeep
+        for (CtField<?> field : removableFields) {
+            toKeep.remove(field);
+            field.delete();
+            // Optional debug: System.out.println("Removed uninitialized static final field: " + field.getSimpleName());
+        }
+        for (CtField<?> field : new ArrayList<>(toKeep.stream()
+                .filter(CtField.class::isInstance)
+                .map(CtField.class::cast)
+                .collect(Collectors.toList()))) {
+
+            if (field.hasModifier(ModifierKind.STATIC) && field.hasModifier(ModifierKind.FINAL)) {
+
+                CtType<?> declaringType = field.getDeclaringType();
+                if (declaringType == null) continue;
+
+                for (CtTypeMember member : declaringType.getTypeMembers()) {
+                    if (member instanceof CtAnonymousExecutable) {
+                        CtAnonymousExecutable staticBlock = (CtAnonymousExecutable) member;
+
+                        boolean assignsInBlock = staticBlock.getElements(new TypeFilter<>(CtAssignment.class)).stream()
+                                .anyMatch(assign -> {
+                                    CtExpression<?> lhs = assign.getAssigned();
+                                    return lhs instanceof CtFieldAccess &&
+                                            ((CtFieldAccess<?>) lhs).getVariable().equals(field.getReference());
+                                });
+
+                        if (assignsInBlock) {
+                            // 🔥 Remove assignment from declaration
+                            field.setAssignment(null);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
 
     }
 
@@ -146,11 +264,30 @@ public class SlicedModelBuilder {
     }
 
 
-
-
     private void pruneType(CtType<?> type) {
         // Track accessed fields from kept methods
         Set<String> accessedFields = new HashSet<>();
+        //System.out.println("🔍 Pruning type: " + type.getQualifiedName());
+
+        // ✅ Preserve referenced nested types (e.g., Tracker)
+        // ✅ Smarter preservation of nested types
+        for (CtTypeMember member : type.getTypeMembers()) {
+            if (member instanceof CtType<?>) {
+                CtType<?> nested = (CtType<?>) member;
+
+                boolean isActuallyReferenced = model.getElements(new TypeFilter<>(CtTypeReference.class)).stream()
+                        .filter(toKeep::contains)
+                        .anyMatch(ref -> ref.getQualifiedName().equals(nested.getQualifiedName()));
+
+
+                if (isActuallyReferenced) {
+                    toKeep.add(nested);
+                    //System.out.println("🔐 [Lean] Keeping truly referenced nested type: " + nested.getQualifiedName());
+                }
+            }
+        }
+
+
         for (CtMethod<?> method : type.getMethods()) {
             if (toKeep.contains(method)) {
                 for (CtFieldAccess<?> access : method.getElements(new TypeFilter<>(CtFieldAccess.class))) {
@@ -176,75 +313,163 @@ public class SlicedModelBuilder {
 
             if (!explicitlyKept && !isInvoked) {
                 method.delete();
-            } else {
-                if (method.getBody() == null && !method.hasModifier(ModifierKind.ABSTRACT)) {
-                    CtBlock<?> emptyBody = method.getFactory().Core().createBlock();
-                    method.setBody(emptyBody);
-                } else if (!isTargetMethod(method) && !isInvoked) {
-                    method.getBody().getStatements().clear();
+            } else if (leanMode && !isTargetMethod(method)) {
+                if (type.isInterface()) {
+                    method.setBody(null); // interfaces can't have bodies
+                } else {
+                    CtBlock<?> body = method.getFactory().Core().createBlock();
+                    CtTypeReference<?> returnType = method.getType();
+
+
+                    if (!"void".equals(returnType.getSimpleName())) {
+                        String returnExpr = getDefaultReturn(returnType);
+                        CtStatement returnStmt = method.getFactory().Code()
+                                .createCodeSnippetStatement("return " + returnExpr);
+                        body.addStatement(returnStmt);
+                    }
+                    for (CtInvocation<?> invocation : method.getElements(new TypeFilter<>(CtInvocation.class))) {
+                        if (!invocation.getExecutable().isStatic() && invocation.getTarget() == null) {
+                         //   System.out.println("⚠️ LeanMode: Removing invocation with null target: " + invocation);
+                            invocation.delete();
+                        }
+                    }
+
+                    method.setBody(body);
+                    method.setVisibility(ModifierKind.PUBLIC);
+
                 }
             }
+
         }
 
-        /* Remove unused fields
-        for (CtField<?> field : new ArrayList<>(type.getFields())) {
-            boolean used = toKeep.contains(field) || accessedFields.contains(field.getSimpleName());
-            if (!used) {
-                field.delete();
-            } else {
-                // Pull in assignment references if
+        if (type instanceof CtClass<?>) {
+            CtClass<?> clazz = (CtClass<?>) type;
 
-                if (field.getAssignment() != null) {
-                    toKeep.addAll(field.getAssignment().getReferencedTypes());
-                    for (CtInvocation<?> invocation : field.getAssignment().getElements(new TypeFilter<>(CtInvocation.class))) {
-                        CtExecutable<?> exec = invocation.getExecutable().getDeclaration();
-                        if (exec != null) toKeep.add(exec);
+            // 💡 Step: Check for missing abstract method implementations
+            List<CtMethod<?>> missingMethods = getUnimplementedAbstractMethods(clazz);
+
+            if (!missingMethods.isEmpty()) {
+                if (!isInstantiated(clazz)) {
+                    if (clazz.hasModifier(ModifierKind.FINAL)) {
+                     //   System.out.println("⚠️ Removing final from class to allow abstract: " + clazz.getQualifiedName());
+                        clazz.removeModifier(ModifierKind.FINAL);
+                    }
+                    clazz.addModifier(ModifierKind.ABSTRACT);
+                  //  System.out.println("🔧 Marked class abstract (not instantiated): " + clazz.getQualifiedName());
+                } else {
+                    // ✅ Instantiated — stub missing methods
+                    for (CtMethod<?> abstractMethod : missingMethods) {
+                        CtMethod<?> stub = abstractMethod.clone();
+                        stub.removeModifier(ModifierKind.ABSTRACT);
+                        stub.setBody(createStubBody(clazz, stub.getType()));
+                        stub.setVisibility(ModifierKind.PUBLIC); // Ensure correct visibility
+                        clazz.addMethod(stub);
+                       // System.out.println("🧪 Stubbed abstract method: " + stub.getSignature() + " in " + clazz.getQualifiedName());
                     }
                 }
             }
+            if (clazz.hasModifier(ModifierKind.ABSTRACT) && isInstantiated(clazz)) {
+                List<CtMethod<?>> stillAbstract = clazz.getMethods().stream()
+                        .filter(m -> m.hasModifier(ModifierKind.ABSTRACT))
+                        .collect(Collectors.toList());
+
+                if (stillAbstract.isEmpty()) {
+                    clazz.removeModifier(ModifierKind.ABSTRACT);
+                   // System.out.println("🧼 Removed abstract modifier: " + clazz.getQualifiedName());
+                }
+            }
+
         }
-*/
 
 
-        // Remove unused fields
         for (CtField<?> field : new ArrayList<>(type.getFields())) {
+
             boolean used = toKeep.contains(field) || accessedFields.contains(field.getSimpleName());
+//            System.out.println("Checking field: " + field.getSimpleName());
+//            System.out.println(" - used? " + used);
+//            System.out.println(" - in toKeep? " + toKeep.contains(field));
+// 🚫 Special case: field refers to an unresolved nested type — remove it
+            if (used) {
+                CtTypeReference<?> fieldType = field.getType();
+                if (fieldType != null) {
+                    for (CtTypeReference<?> arg : fieldType.getActualTypeArguments()) {
+                        CtType<?> argDecl = arg.getDeclaration();
+                        if (argDecl != null && isInProject(argDecl) && !toKeep.contains(argDecl)) {
+                            toKeep.add(argDecl);
+                           // System.out.println("🔗 [Lean] Pulled in generic type argument: " + argDecl.getQualifiedName());
+                        }
+                    }
+                }
+            }
+
             if (!used) {
+                CtTypeReference<?> fieldType = field.getType();
+                if (fieldType != null && fieldType.getQualifiedName().contains("$") &&
+                        fieldType.getDeclaration() == null) {
+                   // System.out.println("🧹 Removing field with unresolved nested type: " + field.getSimpleName());
+                    field.delete();
+                    continue;
+                }
+
                 field.delete();
-            } else {
-                // ⚠️ Special handling for static final fields
-                boolean isFinalStatic = field.hasModifier(ModifierKind.FINAL) && field.hasModifier(ModifierKind.STATIC);
+                continue;
+            }
 
-                if (isFinalStatic) {
-                    boolean hasAssignment = field.getAssignment() != null;
 
-                    boolean hasStaticInitAssignment = toKeep.stream()
-                            .filter(CtAssignment.class::isInstance)
-                            .map(CtAssignment.class::cast)
-                            .anyMatch(assign -> {
-                                CtExpression<?> lhs = assign.getAssigned();
-                                return lhs instanceof CtFieldAccess &&
-                                        ((CtFieldAccess<?>) lhs).getVariable().equals(field.getReference());
-                            });
+            if (SlicedModelBuilder.leanMode) {
+                boolean isStaticFinal = field.hasModifier(ModifierKind.STATIC) && field.hasModifier(ModifierKind.FINAL);
+                boolean hasBrokenAssignment = false;
 
-                    if (!hasAssignment && !hasStaticInitAssignment) {
-                        System.out.println("⚠️ Removing final static field without assignment: " + field.getSimpleName());
-                        field.delete();
+                if (field.getAssignment() != null) {
+                    boolean hasBrokenRef = field.getAssignment()
+                            .getElements(new TypeFilter<>(CtExecutableReferenceExpression.class))
+                            .stream()
+                            .anyMatch(refExpr -> refExpr.getExecutable() == null || refExpr.getExecutable().getDeclaration() == null);
+
+                    boolean hasBrokenCall = field.getAssignment()
+                            .getElements(new TypeFilter<>(CtInvocation.class))
+                            .stream()
+                            .anyMatch(inv -> inv.getExecutable().getDeclaration() == null);
+
+                    hasBrokenAssignment = hasBrokenRef || hasBrokenCall;
+                }
+
+                boolean isReferencedInKeptCode = model
+                        .getElements(new TypeFilter<>(CtFieldRead.class))
+                        .stream()
+                        .anyMatch(read -> {
+                            CtFieldReference<?> ref = read.getVariable();
+                            return ref != null && ref.getSimpleName().equals(field.getSimpleName());
+                        });
+
+                if (isStaticFinal && (hasBrokenAssignment || field.getAssignment() == null)) {
+
+                    if (field instanceof CtEnumValue<?>) {
+                      //  System.out.println("⛔ Skipping enum constant: " + field.getSimpleName());
                         continue;
                     }
 
-                    if (hasStaticInitAssignment) {
-                        // Even if field has no assignment — static block covers it
-                        field.removeModifier(ModifierKind.FINAL); // ✅ always remove final
-                        System.out.println("🧹 Removed FINAL modifier from field: " + field.getSimpleName());
-                    }
+                    if (isReferencedInKeptCode) {
+                      //  System.out.println("🛑 Preserving static final field (referenced): " + field.getSimpleName());
 
-                    if (hasAssignment && hasStaticInitAssignment) {
-                        field.setAssignment(null);
+                        if (field.getAssignment() == null) {
+                            Object fallback = getDefaultReturn(field.getType());
+
+                            field.setAssignment(field.getFactory().Code().createCodeSnippetExpression(fallback.toString()));
+                          //  System.out.println("🛠️ Initialized static final field with dummy value: " + field.getSimpleName());
+
+                        }
+                    } else {
+                     //   System.out.println("🧹 Removing unused static final field: " + field.getSimpleName());
+                        field.delete();
                     }
+                } else if (hasBrokenAssignment) {
+                   // System.out.println("⚠️ Removing invalid assignment from field (lean mode): " + field.getSimpleName());
+                    field.setAssignment(null);
                 }
-
             }
+
+
         }
 
         // ✅ Preserve static blocks (CtAnonymousExecutable) if they're in toKeep
@@ -286,22 +511,64 @@ public class SlicedModelBuilder {
         }
 
         // Prune nested types recursively
+        // Prune nested types recursively
         for (CtType<?> nested : new ArrayList<>(type.getNestedTypes())) {
             if (shouldKeepType(nested)) {
+                // ✅ If nested type is kept, keep its constructors if it's a class
+                if (nested instanceof CtClass<?>) {
+                    for (CtConstructor<?> ctor : ((CtClass<?>) nested).getConstructors()) {
+                        if (!toKeep.contains(ctor)) {
+                            // toKeep.add(ctor);
+                            //  System.out.println("🔧 [Lean] Preserved constructor in nested class: " + ctor.getSignature());
+
+                            // 🧠 Add: Pull in all field references from this constructor
+                            for (CtFieldAccess<?> access : ctor.getElements(new TypeFilter<>(CtFieldAccess.class))) {
+                                CtFieldReference<?> ref = access.getVariable();
+                                CtField<?> field = ref.getDeclaration();
+                                if (field != null && isInProject(field)) {
+                                    //  toKeep.add(field);
+                                    //  System.out.println("📌 [Lean] Preserved field used in constructor: " + field.getSimpleName());
+                                }
+                            }
+                            // 🆕 Pull in fields declared in the nested type that are used in the constructor body
+                            for (CtField<?> nestedField : nested.getFields()) {
+                                boolean usedInCtor = ctor.getElements(new TypeFilter<>(CtFieldAccess.class)).stream()
+                                        .map(CtFieldAccess::getVariable)
+                                        .anyMatch(ref -> ref != null && ref.getSimpleName().equals(nestedField.getSimpleName()));
+
+                                if (usedInCtor && !toKeep.contains(nestedField)) {
+                                    //  toKeep.add(nestedField);
+                                    //  System.out.println("📌 [Lean] Preserved nested field used in constructor: " + nestedField.getSimpleName());
+                                }
+                            }
+
+                        }
+                    }
+                }
+
                 pruneType(nested);
             } else {
                 nested.delete();
             }
+
         }
+
+
+        for (CtField<?> field : new ArrayList<>(type.getFields())) {
+            if (!toKeep.contains(field)) {
+             //   System.out.println("🧹 Hard removing undeclared field: " + field.getSimpleName());
+                field.delete();
+            }
+        }
+
     }
 
 
-
     private boolean isTargetMethod(CtMethod<?> method) {
-        return toKeep.contains(method)
-                || method.getSimpleName().equals("main")
-                || method.hasModifier(ModifierKind.PUBLIC);
-
+        if (trueTargetMethod == null) return false;
+        return method.getDeclaringType().getQualifiedName().equals(
+                trueTargetMethod.getDeclaringType().getQualifiedName()
+        ) && method.getSignature().equals(trueTargetMethod.getSignature());
     }
 
 
@@ -310,6 +577,12 @@ public class SlicedModelBuilder {
             if (el instanceof CtFieldAccess) {
                 CtFieldReference<?> ref = ((CtFieldAccess<?>) el).getVariable();
                 CtField<?> field = ref.getDeclaration();
+                if (field != null && field.getType() != null &&
+                        field.getType().getQualifiedName().contains("$") &&
+                        field.getType().getDeclaration() == null) {
+                    continue;
+                }
+
                 if (field != null) {
                     toKeep.add(field);
                     CtType<?> declaringType = field.getDeclaringType();
@@ -334,7 +607,6 @@ public class SlicedModelBuilder {
                     }
                 }
             }
-
 
 
             // In expandFieldDependencies
@@ -398,7 +670,7 @@ public class SlicedModelBuilder {
                                                     toKeep.add(staticBlock.getBody());
                                                 }
 
-                                                System.out.println("✅ Keeping full static assignment to: " + field.getSimpleName());
+                                               // System.out.println("✅ Keeping full static assignment to: " + field.getSimpleName());
                                             }
                                         }
                                     }
@@ -410,10 +682,9 @@ public class SlicedModelBuilder {
             }
 
 
-
-
         }
     }
+
     private void expandTransitiveTypeReferences() {
         Set<CtTypeReference<?>> discovered = new HashSet<>();
         Queue<CtTypeReference<?>> queue = new LinkedList<>();
@@ -492,7 +763,6 @@ public class SlicedModelBuilder {
     }
 
 
-
     private void expandInvokedMethodDependencies() {
         for (CtElement el : new HashSet<>(toKeep)) {
             if (el instanceof CtInvocation) {
@@ -508,7 +778,7 @@ public class SlicedModelBuilder {
                         CtType<?> declaringType = declaringTypeRef.getDeclaration();
                         if (declaringType != null) {
                             for (CtMethod<?> method : declaringType.getMethods()) {
-                                if (method.getSimpleName().equals(execRef.getSimpleName())&& isInProject(method)) {
+                                if (method.getSimpleName().equals(execRef.getSimpleName()) && isInProject(method)) {
                                     toKeep.add(method);
                                 }
                             }
@@ -602,7 +872,7 @@ public class SlicedModelBuilder {
                                                 m.getParameters().size() == abstractMethod.getParameters().size());
 
                                 if (!isImplemented) {
-                                    System.out.println("🚨 Missing implementation for abstract method: " + abstractMethod.getSignature());
+                                    //System.out.println("🚨 Missing implementation for abstract method: " + abstractMethod.getSignature());
                                     toKeep.add(abstractMethod); // Force keep to avoid accidental slicing
                                 }
                             }
@@ -612,6 +882,25 @@ public class SlicedModelBuilder {
             }
 
         }
+
+        // 🧱 Ensure constructors for direct superclasses are kept if class is kept
+        for (CtType<?> type : model.getAllTypes()) {
+            if (type instanceof CtClass<?>) {
+                CtClass<?> clazz = (CtClass<?>) type;
+                CtTypeReference<?> superTypeRef = clazz.getSuperclass();
+                if (superTypeRef != null) {
+                    CtType<?> superType = superTypeRef.getDeclaration();
+                    if (superType instanceof CtClass<?>) {
+                        for (CtConstructor<?> ctor : ((CtClass<?>) superType).getConstructors()) {
+                            if (ctor.getParameters().stream().allMatch(p -> p.getType() != null)) {
+                                toKeep.add(ctor);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
     }
 
     private boolean isEntryPoint(CtType<?> type) {
@@ -619,6 +908,196 @@ public class SlicedModelBuilder {
                 toKeep.stream().anyMatch(el ->
                         el instanceof CtTypeMember && ((CtTypeMember) el).getDeclaringType() == type);
     }
+
+    public static CtMethod<?> getTrueTargetMethod() {
+        return trueTargetMethod;
+    }
+
+
+    public static void setTrueTargetMethod(CtMethod<?> trueTargetMethod) {
+        SlicedModelBuilder.trueTargetMethod = trueTargetMethod;
+    }
+
+    private String getDefaultReturn(CtTypeReference<?> type) {
+        switch (type.getSimpleName()) {
+            case "int":
+            case "short":
+            case "byte":
+            case "long":
+                return "0";
+            case "float":
+                return "0.0f";
+            case "double":
+                return "0.0";
+            case "boolean":
+                return "false";
+            case "char":
+                return "'a'";
+            case "String":
+                return "\"\"";
+            case "SortedMap":
+            case "Map":
+                return "java.util.Collections.emptySortedMap()";
+            case "List":
+                return "java.util.Collections.emptyList()";
+            default:
+                return "null";
+        }
+    }
+
+    private boolean isInstantiated(CtClass<?> clazz) {
+        return toKeep.stream()
+                .filter(CtConstructorCall.class::isInstance)
+                .map(CtConstructorCall.class::cast)
+                .anyMatch(call -> {
+                    CtTypeReference<?> typeRef = call.getType();
+                    return typeRef != null && typeRef.getQualifiedName().equals(clazz.getQualifiedName());
+                });
+    }
+
+
+    private List<CtMethod<?>> getUnimplementedAbstractMethods(CtClass<?> clazz) {
+        List<CtMethod<?>> missing = new ArrayList<>();
+        Set<String> implementedSignatures = clazz.getMethods().stream()
+                .map(CtMethod::getSignature)
+                .collect(Collectors.toSet());
+
+        Set<CtTypeReference<?>> superTypes = new HashSet<>();
+        if (clazz.getSuperclass() != null) superTypes.add(clazz.getSuperclass());
+        superTypes.addAll(clazz.getSuperInterfaces());
+
+        for (CtTypeReference<?> superRef : superTypes) {
+            CtType<?> superType = superRef.getDeclaration();
+
+            if (superType != null) {
+                // 🥄 Spoon-declared supertype
+                for (CtMethod<?> superMethod : superType.getMethods()) {
+                    if (superMethod.hasModifier(ModifierKind.ABSTRACT)) {
+                        if (!implementedSignatures.contains(superMethod.getSignature())) {
+                            missing.add(superMethod);
+                        }
+                    }
+                }
+            } else {
+                // 🪞 Fallback: Reflection
+                try {
+                    Class<?> refl = Class.forName(superRef.getQualifiedName());
+                    for (java.lang.reflect.Method m : refl.getMethods()) {
+                        if (!java.lang.reflect.Modifier.isAbstract(m.getModifiers())) continue;
+
+                        String sig = m.getName() + "(" + Arrays.stream(m.getParameterTypes())
+                                .map(Class::getSimpleName)
+                                .collect(Collectors.joining(", ")) + ")";
+
+                        boolean alreadyImplemented = implementedSignatures.stream().anyMatch(s -> s.startsWith(m.getName() + "("));
+                        if (alreadyImplemented) continue;
+
+                        // 🔧 Create stub method
+                        CtMethod<?> stub = clazz.getFactory().Core().createMethod();
+                        stub.setSimpleName(m.getName());
+                        stub.setType(clazz.getFactory().Type().createReference(m.getReturnType()));
+
+                        for (int i = 0; i < m.getParameterCount(); i++) {
+                            Class<?> paramType = m.getParameterTypes()[i];
+                            CtParameter<?> param = clazz.getFactory().Core().createParameter();
+                            param.setType(clazz.getFactory().Type().createReference(paramType));
+                            param.setSimpleName("arg" + i);
+                            stub.addParameter(param);
+                        }
+
+                        CtBlock<?> body = createStubBody(clazz, stub.getType());
+                        stub.setBody(body);
+                        missing.add(stub);
+                    }
+                } catch (ClassNotFoundException e) {
+                  //  System.out.println("⚠️ Could not reflect type: " + superRef.getQualifiedName());
+                }
+            }
+        }
+
+        return missing;
+    }
+
+    private CtBlock<?> createStubBody(CtClass<?> clazz, CtTypeReference<?> returnType) {
+        CtBlock<?> body = clazz.getFactory().Core().createBlock();
+
+        if (!"void".equals(returnType.getSimpleName())) {
+            String expr = getDefaultReturn(returnType);
+            CtStatement returnStmt = clazz.getFactory().Code().createCodeSnippetStatement("return " + expr);
+            body.addStatement(returnStmt);
+        }
+
+        return body;
+    }
+
+
+    private void expandMinimalDependencies() {
+        Set<CtElement> copy = new HashSet<>(toKeep);
+
+        for (CtElement el : copy) {
+            // 🔹 Invocation resolution
+            if (el instanceof CtInvocation<?>) {
+                CtInvocation<?> invocation = (CtInvocation<?>) el;
+                CtExecutable<?> exec = invocation.getExecutable().getDeclaration();
+                if (exec != null) toKeep.add(exec);
+            }
+
+            // 🔹 Constructor resolution
+            if (el instanceof CtConstructorCall<?>) {
+                CtConstructorCall<?> call = (CtConstructorCall<?>) el;
+                CtExecutable<?> exec = call.getExecutable().getDeclaration();
+                if (exec != null) toKeep.add(exec);
+
+                for (CtExpression<?> arg : call.getArguments()) {
+                    for (CtInvocation<?> inner : arg.getElements(new TypeFilter<>(CtInvocation.class))) {
+                        CtExecutable<?> innerExec = inner.getExecutable().getDeclaration();
+                        if (innerExec != null) toKeep.add(innerExec);
+                    }
+                }
+            }
+
+
+            if (el instanceof CtFieldAccess<?>) {
+                CtField<?> field = ((CtFieldAccess<?>) el).getVariable().getDeclaration();
+
+                if (field != null && field.hasModifier(ModifierKind.STATIC)) {
+
+                    // ✅ Only preserve static block if field is actually needed
+                    if (!toKeep.contains(field)) continue;
+
+                    CtType<?> declaringType = field.getDeclaringType();
+                    if (declaringType != null) {
+                        for (CtTypeMember member : declaringType.getTypeMembers()) {
+                            if (member instanceof CtAnonymousExecutable) {
+                                CtAnonymousExecutable staticBlock = (CtAnonymousExecutable) member;
+
+                                boolean assignsField = staticBlock.getElements(new TypeFilter<>(CtAssignment.class)).stream()
+                                        .anyMatch(assign -> {
+                                            CtExpression<?> lhs = assign.getAssigned();
+                                            if (lhs instanceof CtFieldAccess<?>) {
+                                                CtFieldReference<?> lhsRef = ((CtFieldAccess<?>) lhs).getVariable();
+                                                return lhsRef.equals(field.getReference());
+                                            }
+                                            return false;
+                                        });
+
+                                if (assignsField) {
+                                    toKeep.add(staticBlock);
+                                    if (staticBlock.getBody() != null)
+                                        toKeep.add(staticBlock.getBody());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+
+
+
+        }
+    }
+
 
 
 }

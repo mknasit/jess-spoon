@@ -6,10 +6,10 @@ import org.example.service.BulkSliceService;
 import org.example.slicer.SlicedModelBuilder;
 import org.junit.jupiter.api.Test;
 import spoon.reflect.declaration.CtElement;
-import spoon.reflect.declaration.CtMethod;
+import spoon.reflect.declaration.CtType;
 
-import java.io.File;
 import java.util.*;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -22,10 +22,17 @@ public class SpoonAnalyzerTest {
         Map<String, List<String>> targets = Map.of(
                 "Worker", List.of("doWork")
         );
-
+        SlicedModelBuilder.leanMode = true;
         Set<CtElement> deps = analyzer.findAndCollectMultipleTargets(targets);
         SlicedModelBuilder slicer = new SlicedModelBuilder(analyzer.getModel(), deps);
         slicer.slice();
+        System.out.println("🔎 Keeping elements:");
+        deps.forEach(e -> System.out.println("  - " + e.getClass().getSimpleName() + ": " + e.toString()));
+        for (CtType<?> type : slicer.model.getAllTypes()) {
+            System.out.println("Kept class: " + type.getQualifiedName());
+            System.out.println("  Kept methods: " + type.getMethods().stream().filter(slicer.toKeep::contains).collect(Collectors.toList()));
+            System.out.println("  Kept fields: " + type.getFields().stream().filter(slicer.toKeep::contains).collect(Collectors.toList()));
+        }
         analyzer.printSlicedModel();
         JavaCompilerService compiler = new JavaCompilerService();
         compiler.compileSlicedAnalyzer(analyzer);
