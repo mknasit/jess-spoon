@@ -30,8 +30,8 @@ public class SpoonAnalyzerTest {
         deps.forEach(e -> System.out.println("  - " + e.getClass().getSimpleName() + ": " + e.toString()));
         for (CtType<?> type : slicer.model.getAllTypes()) {
             System.out.println("Kept class: " + type.getQualifiedName());
-            System.out.println("  Kept methods: " + type.getMethods().stream().filter(slicer.toKeep::contains).collect(Collectors.toList()));
-            System.out.println("  Kept fields: " + type.getFields().stream().filter(slicer.toKeep::contains).collect(Collectors.toList()));
+          //  System.out.println("  Kept methods: " + type.getMethods().stream().filter(slicer.toKeep::contains).collect(Collectors.toList()));
+           // System.out.println("  Kept fields: " + type.getFields().stream().filter(slicer.toKeep::contains).collect(Collectors.toList()));
         }
         analyzer.printSlicedModel();
         JavaCompilerService compiler = new JavaCompilerService();
@@ -68,7 +68,7 @@ public class SpoonAnalyzerTest {
     public void testCommonsLangSrcCompilation() {
         BulkSliceService bulk = new BulkSliceService();
        // bulk.runFullAnalysis("/Users/mitul/Documents/study/Thesis/partial compilation/slicing_testing/commons-lang/src/main/java");
-       //bulk.runFullAnalysis("/Users/mitul/Documents/study/Thesis/partial compilation/slicing_testing/SimpleRtmp/src/com/github/faucamp/simplertmp");
+      // bulk.runFullAnalysis("/Users/mitul/Documents/study/Thesis/partial compilation/slicing_testing/SimpleRtmp/src/com/github/faucamp/simplertmp");
          bulk.runFullAnalysis("/Users/mitul/Documents/study/Thesis/partial compilation/slicing_testing/commons-io/src/main/java");
         System.out.println("=== PASS === "+ bulk.getPassedMethods().size());
         //bulk.getPassedMethods().forEach(System.out::println);

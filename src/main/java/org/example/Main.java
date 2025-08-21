@@ -24,16 +24,5 @@ public class Main {
 
         System.out.println("Found method: " + target.getSignature());
 
-        Set<CtElement> deps = analyzer.collectResolvedDependencies(target);
-        deps.add(target);
-        System.out.println("Marked for keep: " + target.getSignature());
-
-        for (CtElement e : deps) {
-            System.out.println("[" + e.getClass().getSimpleName() + "] " + e.toString());
-        }
-
-        SlicedModelBuilder slicer = new SlicedModelBuilder(analyzer.getModel(), deps);
-        slicer.slice();
-
     }
 }

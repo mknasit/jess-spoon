@@ -2,116 +2,52 @@ package org.example.slicer;
 
 import spoon.reflect.CtModel;
 import spoon.reflect.code.CtConstructorCall;
-import spoon.reflect.code.CtInvocation;
-import spoon.reflect.cu.position.NoSourcePosition;
 import spoon.reflect.declaration.*;
+import spoon.reflect.reference.CtArrayTypeReference;
 import spoon.reflect.reference.CtExecutableReference;
 import spoon.reflect.reference.CtFieldReference;
 import spoon.reflect.reference.CtTypeReference;
 
-public final class SlicingUtils {
+import java.util.Arrays;
 
+public final class SlicingUtils {
     private SlicingUtils() {}
 
-    /** Mirror of your old unresolved/missing decl filter, compatible with Spoon 10.4.2. */
-    public static boolean isUnresolved(CtElement el, CtModel model) {
-        if (el instanceof CtTypeReference) {
-            CtTypeReference<?> ref = (CtTypeReference<?>) el;
-            CtType<?> decl = ref.getDeclaration();
-            String qn = ref.getQualifiedName();
-            if (decl == null) {
-                if (qn == null) return true;
-                if (qn.matches("^[A-Z]$")) return false;  // generic param like T
-                if (qn.startsWith("java.")) return false; // allow unresolved JDK types
-                return true;
-            }
-            return hasNoSource(decl);
-        }
-
-        if (el instanceof CtExecutableReference) {
-            CtExecutableReference<?> ref = (CtExecutableReference<?>) el;
-            CtExecutable<?> decl = ref.getDeclaration();
-            return decl == null || hasNoSource(decl);
-        }
-
-        if (el instanceof CtMethod) {
-            CtMethod<?> m = (CtMethod<?>) el;
-            CtType<?> parent = m.getDeclaringType();
-            return parent == null || hasNoSource(parent);
-        }
-
-        if (el instanceof CtConstructor) {
-            CtConstructor<?> c = (CtConstructor<?>) el;
-            CtType<?> parent = c.getDeclaringType();
-            return parent == null || hasNoSource(parent);
-        }
-
-        if (el instanceof CtFieldReference) {
-            CtFieldReference<?> ref = (CtFieldReference<?>) el;
-            CtField<?> field = ref.getDeclaration();
-            return field == null || hasNoSource(field);
-        }
-
-        if (el instanceof CtField) {
-            CtField<?> f = (CtField<?>) el;
-            return f.getDeclaringType() == null;
-        }
-
-        if (el instanceof CtInvocation) {
-            CtInvocation<?> inv = (CtInvocation<?>) el;
-            return inv.getExecutable() == null || inv.getExecutable().getDeclaration() == null;
-        }
-
-        if (el instanceof CtConstructorCall) {
-            CtConstructorCall<?> call = (CtConstructorCall<?>) el;
-            return call.getExecutable() == null || call.getExecutable().getDeclaration() == null;
-        }
-
-        return false;
-    }
-
-    public static boolean hasNoSource(CtElement el) {
-        return el.getPosition() == null || el.getPosition() instanceof NoSourcePosition;
+    public static boolean isTargetMethod(CtMethod<?> m, CtMethod<?> target) {
+        if (m == null || target == null) return false;
+        return m.getDeclaringType().getQualifiedName().equals(
+                target.getDeclaringType().getQualifiedName()
+        ) && m.getSignature().equals(target.getSignature());
     }
 
     public static boolean isInProject(CtElement el, CtModel model) {
-        CtType<?> type = el.getParent(CtType.class);
-        if (type == null) return false;
-
-        String qName = type.getQualifiedName();
-        if (qName.startsWith("java.") || qName.startsWith("javax.")) return false;
-        if (!qName.contains(".") || qName.equals("<nulltype>")) return false;
-
-        return model.getAllTypes().contains(type);
+        CtType<?> t = el.getParent(CtType.class);
+        if (t == null) return false;
+        String qn = t.getQualifiedName();
+        if (qn.startsWith("java.") || qn.startsWith("javax.")) return false;
+        return model.getAllTypes().contains(t);
     }
 
-    public static boolean isTargetMethod(CtMethod<?> method, CtMethod<?> target) {
-        if (method == null || target == null) return false;
-        CtType<?> a = method.getDeclaringType();
-        CtType<?> b = target.getDeclaringType();
-        if (a == null || b == null) return false;
-        return a.getQualifiedName().equals(b.getQualifiedName())
-                && method.getSignature().equals(target.getSignature());
+    public static boolean implementsAny(CtClass<?> c, String... qns) {
+        for (CtTypeReference<?> i : c.getSuperInterfaces()) {
+            for (String qn : qns) if (qn.equals(i.getQualifiedName())) return true;
+        }
+        return false;
     }
 
     public static String getDefaultReturn(CtTypeReference<?> type) {
         if (type == null) return "null";
-        switch (type.getSimpleName()) {
+        String s = type.getSimpleName();
+        switch (s) {
             case "int":
             case "short":
             case "byte":
-            case "long":
-                return "0";
-            case "float":
-                return "0.0f";
-            case "double":
-                return "0.0";
-            case "boolean":
-                return "false";
-            case "char":
-                return "'a'";
-            case "String":
-                return "\"\"";
+            case "long": return "0";
+            case "float": return "0.0f";
+            case "double": return "0.0";
+            case "boolean": return "false";
+            case "char": return "'\\0'";
+            case "String": return "\"\"";
             case "SortedMap":
                 return "java.util.Collections.emptySortedMap()";
             case "Map":
@@ -120,81 +56,102 @@ public final class SlicingUtils {
                 return "java.util.Collections.emptyList()";
             case "Set":
                 return "java.util.Collections.emptySet()";
-            default:
-                return "null";
+            default: return "null";
         }
     }
 
-    public static String defaultArgsForExecutable(CtConstructor<?> ctor) {
-        java.util.List<String> args = new java.util.ArrayList<>();
-        for (CtParameter<?> p : ctor.getParameters()) {
-            args.add(defaultArgForType(p.getType()));
-        }
-        return String.join(", ", args);
-    }
 
-    private static String defaultArgForType(CtTypeReference<?> t) {
-        if (t == null) return "null";
-        if (t.isPrimitive()) {
-            switch (t.getSimpleName()) {
+
+    /** default initializer expression usable in a field declaration (esp. for final instance fields). */
+    public static String defaultInitExprFor(CtTypeReference<?> type) {
+        if (type == null) return "null";
+
+        if (type.isPrimitive()) {
+            switch (type.getSimpleName()) {
+                case "int":
+                case "short":
+                case "byte":
+                case "long": return "0";
+                case "float": return "0.0f";
+                case "double": return "0.0";
                 case "boolean": return "false";
-                case "char":    return "'\\0'";
-                case "float":   return "0.0f";
-                case "double":  return "0.0";
-                default:        return "0";
+                case "char": return "'\\0'";
             }
+            return "0";
         }
+
+        // arrays
+        if (type instanceof CtArrayTypeReference<?>) {
+            CtTypeReference<?> comp = ((CtArrayTypeReference<?>) type).getComponentType();
+            String compQN = comp != null ? comp.getQualifiedName() : "java.lang.Object";
+            return "new " + compQN + "[0]";
+        }
+        // fallback for unresolved array qnames like "int[]" when Spoon didn't build a CtArrayTypeReference
+        if (type.getQualifiedName() != null && type.getQualifiedName().endsWith("[]")) {
+            String base = type.getQualifiedName().substring(0, type.getQualifiedName().length() - 2);
+            if (base.isEmpty()) base = "java.lang.Object";
+            return "new " + base + "[0]";
+        }
+
+        // object/reference
         return "null";
     }
 
-    public static boolean implementsAny(CtClass<?> clazz, String... fqns) {
-        java.util.Set<String> names = new java.util.HashSet<>();
-        for (CtTypeReference<?> i : clazz.getSuperInterfaces()) {
-            names.add(i.getQualifiedName());
-        }
-        CtTypeReference<?> s = clazz.getSuperclass();
-        while (s != null) {
-            names.add(s.getQualifiedName());
-            CtType<?> decl = s.getDeclaration();
-            if (decl instanceof CtClass) {
-                for (CtTypeReference<?> i : ((CtClass<?>) decl).getSuperInterfaces()) {
-                    names.add(i.getQualifiedName());
-                }
-                s = ((CtClass<?>) decl).getSuperclass();
-            } else {
-                break;
-            }
-        }
-        for (String want : fqns) if (names.contains(want)) return true;
-        return false;
-    }
-
-    // SlicingUtils.java
-    public static String defaultArgsForParameterTypes(Class<?>[] types) {
+    public static String defaultArgsForExecutable(CtExecutable<?> exec) {
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < types.length; i++) {
-            Class<?> t = types[i];
-            String v;
-            if (!t.isPrimitive()) {
-                v = "null";
-            } else if (t == boolean.class) {
-                v = "false";
-            } else if (t == char.class) {
-                v = "'\\0'";
-            } else if (t == long.class) {
-                v = "0L";
-            } else if (t == float.class) {
-                v = "0.0f";
-            } else if (t == double.class) {
-                v = "0.0";
-            } else {
-                v = "0";
-            }
-            if (i > 0) sb.append(", ");
-            sb.append(v);
+        boolean first = true;
+        for (CtParameter<?> p : exec.getParameters()) {
+            if (!first) sb.append(", ");
+            first = false;
+            CtTypeReference<?> t = p.getType();
+            sb.append(defaultInitExprFor(t));
         }
         return sb.toString();
     }
 
+    public static String defaultArgsForParameterTypes(Class<?>[] pts) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < pts.length; i++) {
+            if (i > 0) sb.append(", ");
+            Class<?> pt = pts[i];
+            if (pt.isPrimitive()) {
+                if (pt == boolean.class) sb.append("false");
+                else if (pt == char.class) sb.append("'\\0'");
+                else if (pt == float.class) sb.append("0.0f");
+                else if (pt == double.class) sb.append("0.0");
+                else sb.append("0");
+            } else if (pt.isArray()) {
+                String comp = pt.getComponentType().getName();
+                sb.append("new ").append(comp).append("[0]");
+            } else {
+                sb.append("null");
+            }
+        }
+        return sb.toString();
+    }
 
+    /** Treat unresolved references as non-project / should drop from KeepSet. */
+    public static boolean isUnresolved(CtElement el, CtModel model) {
+        if (el instanceof CtTypeReference) {
+            CtTypeReference<?> r = (CtTypeReference<?>) el;
+            if (r.getDeclaration() == null && !r.getQualifiedName().startsWith("java.")) {
+                return true;
+            }
+        }
+        if (el instanceof CtExecutableReference) {
+            return ((CtExecutableReference<?>) el).getDeclaration() == null;
+        }
+        if (el instanceof CtFieldReference) {
+            return ((CtFieldReference<?>) el).getDeclaration() == null;
+        }
+        if (el instanceof CtMethod) {
+            CtType<?> parent = ((CtMethod<?>) el).getDeclaringType();
+            return parent == null || !model.getAllTypes().contains(parent);
+        }
+        if (el instanceof CtConstructor) {
+            CtType<?> parent = ((CtConstructor<?>) el).getDeclaringType();
+            return parent == null || !model.getAllTypes().contains(parent);
+        }
+        return false;
+    }
 }

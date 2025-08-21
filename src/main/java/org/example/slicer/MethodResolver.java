@@ -13,15 +13,15 @@ import java.util.stream.Collectors;
 public class MethodResolver {
 
     private final CtModel model;
-    private final Set<CtElement> toKeep;
+    private final Set<CtElement> kept; // read-only view
 
-    public MethodResolver(CtModel model, Set<CtElement> toKeep) {
+    public MethodResolver(CtModel model, Set<CtElement> kept) {
         this.model = model;
-        this.toKeep = toKeep;
+        this.kept = kept;
     }
 
     public boolean isInstantiated(CtClass<?> clazz) {
-        return toKeep.stream()
+        return kept.stream()
                 .filter(CtConstructorCall.class::isInstance)
                 .map(CtConstructorCall.class::cast)
                 .anyMatch(call -> {
@@ -62,34 +62,28 @@ public class MethodResolver {
                     }
                 }
             } else {
-                // Reflection fallback
+                // reflection fallback
                 try {
                     Class<?> refl = Class.forName(superRef.getQualifiedName());
                     for (java.lang.reflect.Method m : refl.getMethods()) {
                         if (!java.lang.reflect.Modifier.isAbstract(m.getModifiers())) continue;
-
-                        boolean alreadyImplemented = implementedSignatures.stream()
-                                .anyMatch(s -> s.startsWith(m.getName() + "("));
-                        if (alreadyImplemented) continue;
+                        boolean already = implementedSignatures.stream()
+                                .anyMatch(sig -> sig.startsWith(m.getName() + "("));
+                        if (already) continue;
 
                         CtMethod<?> stub = clazz.getFactory().Core().createMethod();
                         stub.setSimpleName(m.getName());
                         stub.setType(clazz.getFactory().Type().createReference(m.getReturnType()));
-
                         for (int i = 0; i < m.getParameterCount(); i++) {
-                            Class<?> paramType = m.getParameterTypes()[i];
-                            CtParameter<?> param = clazz.getFactory().Core().createParameter();
-                            param.setType(clazz.getFactory().Type().createReference(paramType));
-                            param.setSimpleName("arg" + i);
-                            stub.addParameter(param);
+                            CtParameter<?> p = clazz.getFactory().Core().createParameter();
+                            p.setSimpleName("arg" + i);
+                            p.setType(clazz.getFactory().Type().createReference(m.getParameterTypes()[i]));
+                            stub.addParameter(p);
                         }
-
-                        CtBlock<?> body = createStubBody(clazz, stub.getType());
-                        stub.setBody(body);
+                        stub.setBody(createStubBody(clazz, stub.getType()));
                         missing.add(stub);
                     }
-                } catch (ClassNotFoundException ignored) {
-                }
+                } catch (Throwable ignore) {}
             }
         }
         return missing;
