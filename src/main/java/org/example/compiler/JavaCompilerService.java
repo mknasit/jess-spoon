@@ -2,6 +2,11 @@ package org.example.compiler;
 
 import org.example.analyzer.SpoonAnalyzer;
 import org.example.service.BulkSliceService;
+import spoon.reflect.code.CtCodeSnippetExpression;
+import spoon.reflect.code.CtExpression;
+import spoon.reflect.code.CtNewClass;
+import spoon.reflect.declaration.CtClass;
+import spoon.reflect.declaration.CtEnumValue;
 import spoon.reflect.declaration.CtType;
 
 import javax.tools.*;
@@ -13,6 +18,7 @@ import java.util.*;
 import spoon.reflect.reference.CtReference;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.DefaultJavaPrettyPrinter;
+import spoon.reflect.visitor.filter.TypeFilter;
 
 public class JavaCompilerService {
 
@@ -60,6 +66,9 @@ public class JavaCompilerService {
             targetDir.mkdirs();
         }
 
+
+
+
         for (CtType<?> type : analyzer.getModel().getAllTypes()) {
 
             type.getFactory().CompilationUnit().getOrCreate(type).getImports()
@@ -68,6 +77,25 @@ public class JavaCompilerService {
                         return ref instanceof CtTypeReference &&
                                 !analyzer.getModel().getAllTypes().contains(((CtTypeReference<?>) ref).getDeclaration());
                     });
+
+            // In JavaCompilerService.exportSlicedSources(...) just before writing types:
+            for (CtEnumValue<?> ev : analyzer.getModel().getElements(new TypeFilter<>(CtEnumValue.class))) {
+                CtExpression<?> init = ev.getDefaultExpression();
+                if (init instanceof CtCodeSnippetExpression) {
+                    // Do NOT let the pretty-printer see a snippet here.
+                    ev.setDefaultExpression(null);
+                }
+            }
+
+
+            for (CtNewClass<?> nc : analyzer.getModel().getElements(new TypeFilter<>(CtNewClass.class))) {
+                if (nc.getParent(CtEnumValue.class) != null && nc.getAnonymousClass() != null) {
+                    // If the enum no longer has the matching ctor, drop the body.
+                    if (((CtClass<?>)nc.getAnonymousClass()).getMethods().isEmpty()) {
+                        nc.setAnonymousClass(null);
+                    }
+                }
+            }
 
             String code;
 
@@ -86,35 +114,6 @@ public class JavaCompilerService {
             } catch (IOException e) {
                 e.printStackTrace();
             }
-        }
-    }
-
-
-    private boolean compileFromSourceold(File sourceDir, File outputDir) {
-        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
-        if (compiler == null) {
-            //System.err.println("❌ No system Java compiler found. Are you using a JDK?");
-            return false;
-        }
-
-        List<File> javaFiles = findJavaFiles(sourceDir);
-        if (javaFiles.isEmpty()) {
-            //System.err.println("❌ No Java files to compile.");
-            return false;
-        }
-
-        // System.out.println("🛠️ Compiling sliced source files:");
-        // javaFiles.forEach(file -> System.out.println(" - " + file.getName()));
-
-        try (StandardJavaFileManager fileManager = compiler.getStandardFileManager(null, Locale.getDefault(), StandardCharsets.UTF_8)) {
-            Iterable<? extends JavaFileObject> sources = fileManager.getJavaFileObjectsFromFiles(javaFiles);
-            List<String> options = List.of("-d", outputDir.getAbsolutePath());
-
-            JavaCompiler.CompilationTask task = compiler.getTask(new PrintWriter(System.out, true), fileManager, null, options, null, sources);
-            return task.call();
-        } catch (IOException e) {
-            e.printStackTrace();
-            return false;
         }
     }
 

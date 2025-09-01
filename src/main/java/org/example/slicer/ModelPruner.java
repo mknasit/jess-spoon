@@ -60,16 +60,35 @@ public class ModelPruner {
     public void pruneType(CtType<?> type) {
         Set<String> accessedFields = new HashSet<>();
 
-        // pull nested types that are referenced by kept type-refs
-        for (CtTypeMember member : type.getTypeMembers()) {
-            if (member instanceof CtType<?>) {
-                CtType<?> nested = (CtType<?>) member;
-                boolean refd = model.getElements(new TypeFilter<>(CtTypeReference.class)).stream()
-                        .filter(keep.elements()::contains)
-                        .anyMatch(ref -> ref.getQualifiedName().equals(nested.getQualifiedName()));
-                if (refd) keep.markSig(nested);
-            }
+        if (type instanceof CtInterface<?>) {
+            keepSamIfFunctional((CtInterface<?>) type);
         }
+
+        // pull nested types that are referenced by kept type-refs
+        // nested types referenced by kept type-refs OR used as superclass of any kept class
+        for (CtTypeMember member : type.getTypeMembers()) {
+            if (!(member instanceof CtType)) continue;
+            CtType<?> nested = (CtType<?>) member;
+            String want = nested.getQualifiedName();
+
+            boolean referenced =
+                    // any kept type reference…
+                    model.getElements(new TypeFilter<>(CtTypeReference.class)).stream()
+                            .filter(keep.elements()::contains)
+                            .anyMatch(ref -> want.equals(ref.getQualifiedName()))
+                            ||
+                            // …or any kept class whose super is exactly this nested type
+                            model.getElements(new TypeFilter<>(CtClass.class)).stream()
+                                    .filter(keep.elements()::contains)
+                                    .map(CtClass.class::cast)
+                                    .anyMatch(c -> {
+                                        CtTypeReference<?> sc = c.getSuperclass();
+                                        return sc != null && want.equals(sc.getQualifiedName());
+                                    });
+
+            if (referenced) keep.markSig(nested);
+        }
+
 
         // field names accessed inside kept methods
         for (CtMethod<?> m : type.getMethods()) {
@@ -119,11 +138,11 @@ public class ModelPruner {
                         String expr = SlicingUtils.getDefaultReturn(ret);
                         body.addStatement(m.getFactory().Code().createCodeSnippetStatement("return " + expr));
                     }
-                    for (CtInvocation<?> inv : m.getElements(new TypeFilter<>(CtInvocation.class))) {
-                        if (!inv.getExecutable().isStatic() && inv.getTarget() == null) {
-                            inv.delete();
-                        }
-                    }
+                  //  for (CtInvocation<?> inv : m.getElements(new TypeFilter<>(CtInvocation.class))) {
+                     //   if (!inv.getExecutable().isStatic() && inv.getTarget() == null) {
+                       //     inv.delete();
+                        //}
+                   // }
                     m.setBody(body);
                     m.setVisibility(ModifierKind.PUBLIC);
                 }
@@ -140,6 +159,7 @@ public class ModelPruner {
             if (uc != null) keep.markFull(uc);
             ensureSuperCtorOrSynthesize(clazz);
             ensureTryWithResourcesFriendlyClose(clazz);
+            ensureFilterLikeSuperCtor(clazz);
 
             List<CtMethod<?>> missing = resolver.getUnimplementedAbstractMethods(clazz);
             if (!missing.isEmpty()) {
@@ -160,6 +180,22 @@ public class ModelPruner {
                 boolean noneLeft = clazz.getMethods().stream().noneMatch(mm -> mm.hasModifier(ModifierKind.ABSTRACT));
                 if (noneLeft) clazz.removeModifier(ModifierKind.ABSTRACT);
             }
+            // If implements any interface and we couldn’t fully resolve, be conservative:
+            // Optional conservative guard (safe)
+            {
+                boolean allStaticMembers =
+                        clazz.getMethods().stream().allMatch(m -> m.hasModifier(ModifierKind.STATIC)) &&
+                                clazz.getFields().stream().allMatch(f -> f.hasModifier(ModifierKind.STATIC));
+
+                boolean hasMissing = !resolver.getUnimplementedAbstractMethods(clazz).isEmpty();
+
+                if (!resolver.isInstantiated(clazz) && hasMissing && !allStaticMembers) {
+                    if (clazz.hasModifier(ModifierKind.FINAL)) clazz.removeModifier(ModifierKind.FINAL);
+                    if (!clazz.hasModifier(ModifierKind.ABSTRACT)) clazz.addModifier(ModifierKind.ABSTRACT);
+                }
+            }
+
+
         }
 
         // fields (very important for correctness/minimality)
@@ -313,6 +349,7 @@ public class ModelPruner {
                 if (assignedInStaticBlock) {
                     // Avoid double-write: if a static block assigns it, declaration MUST NOT initialize it.
                     field.setAssignment(null);
+                    field.removeModifier(ModifierKind.FINAL);
                 } else if (field.getAssignment() == null) {
                     // Still referenced but not assigned anywhere else: give a harmless initializer
                     // so "final" rule is satisfied.
@@ -660,6 +697,71 @@ public class ModelPruner {
             }
         }
     }
+
+
+    private boolean isFunctionalInterface(CtInterface<?> itf) {
+        long abstractCount = itf.getMethods().stream()
+                .filter(m -> m.getBody() == null                     // no body => abstract in interface
+                        && !m.hasModifier(ModifierKind.STATIC)
+                        && !m.hasModifier(ModifierKind.PRIVATE))
+                .count();
+        return abstractCount == 1;
+    }
+
+    private void keepSamIfFunctional(CtInterface<?> itf) {
+        if (!isFunctionalInterface(itf)) return;
+        for (CtMethod<?> m : itf.getMethods()) {
+            boolean isAbstractSAM = m.getBody() == null
+                    && !m.hasModifier(ModifierKind.STATIC)
+                    && !m.hasModifier(ModifierKind.PRIVATE);
+            if (isAbstractSAM) keep.markSig(m);
+        }
+    }
+
+    /** Ensure wrapper classes have a ctor that calls the required super(Input/Output)Stream/Reader/Writer ctor. */
+    private void ensureFilterLikeSuperCtor(CtClass<?> clazz) {
+        CtTypeReference<?> sc = clazz.getSuperclass();
+        if (sc == null) return;
+
+        String qn = sc.getQualifiedName();
+        String neededParamType;
+
+        if ("java.io.FilterInputStream".equals(qn) || "org.apache.commons.io.input.ProxyInputStream".equals(qn)) {
+            neededParamType = "java.io.InputStream";
+        } else if ("java.io.FilterOutputStream".equals(qn) || "org.apache.commons.io.output.ProxyOutputStream".equals(qn)) {
+            neededParamType = "java.io.OutputStream";
+        } else if ("java.io.FilterReader".equals(qn)) {
+            neededParamType = "java.io.Reader";
+        } else if ("java.io.FilterWriter".equals(qn)) {
+            neededParamType = "java.io.Writer";
+        } else {
+            neededParamType = null;
+            return;
+        }
+
+        boolean hasCtor = clazz.getConstructors().stream().anyMatch(c ->
+                c.getParameters().size() == 1 &&
+                        neededParamType.equals(c.getParameters().get(0).getType().getQualifiedName())
+        );
+        if (hasCtor) return;
+
+        CtConstructor<?> ctor = clazz.getFactory().Core().createConstructor();
+        ctor.setSimpleName(clazz.getSimpleName());
+        ctor.addModifier(ModifierKind.PUBLIC);
+
+        CtParameter<?> p = clazz.getFactory().Core().createParameter();
+        p.setSimpleName("delegate");
+        p.setType(clazz.getFactory().Type().createReference(neededParamType));
+        ctor.addParameter(p);
+
+        CtBlock<?> body = clazz.getFactory().Core().createBlock();
+        body.addStatement(clazz.getFactory().Code().createCodeSnippetStatement("super(delegate);"));
+        ctor.setBody(body);
+
+        ((CtClass) clazz).addConstructor((CtConstructor) ctor);
+        keep.markFull(ctor); // don't prune it away
+    }
+
 
 
 

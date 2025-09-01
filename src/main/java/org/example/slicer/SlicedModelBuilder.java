@@ -30,6 +30,7 @@ public class SlicedModelBuilder {
         this.keep = new KeepSet();
         for (CtElement el : initialSeed) keep.markSig(el);
 
+
         this.depAnalyzer = new DependencyAnalyzer(model, keep);
         this.resolver = new MethodResolver(model, keep.elements());
         this.pruner = new ModelPruner(model, keep, resolver);
@@ -37,14 +38,16 @@ public class SlicedModelBuilder {
 
     public void slice() {
         // target method is FULL
+
+
         if (trueTargetMethod != null) {
             keep.markFull(trueTargetMethod);
             CtType<?> owner = trueTargetMethod.getDeclaringType();
             if (owner != null) keep.markSig(owner);
         }
-
+        depAnalyzer.expandFixpoint(keep.elements());
         // Minimal expansion only (lean)
-        depAnalyzer.expandMinimalDependencies();
+       // depAnalyzer.expandMinimalDependencies();
 
         // (optional) rewrite qualified static assignments inside kept static blocks
         rewriteQualifiedStaticAssignments();
@@ -94,18 +97,18 @@ public class SlicedModelBuilder {
                 if (field == null) continue;
 
                 boolean sameOwner = field.getDeclaringType() == block.getParent(CtType.class);
-                // Replace with a simple static field *write*: STANDARD_CHARSET_MAP = ...
+                // BEFORE: you had createVariableRead(...) which turns the LHS into a read
                 CtExpression<?> newLhs = field.getFactory().Code().createVariableWrite(ref, true);
-
-// Make sure there is NO receiver (no 'this.', no 'Type.this.')
-                if (newLhs instanceof CtFieldWrite) {
-                    ((CtFieldWrite<?>) newLhs).setTarget(null);  // prints just STANDARD_CHARSET_MAP
-                }
-
-// avoid generic capture issues on CtAssignment#setAssigned
-                @SuppressWarnings({"rawtypes", "unchecked"})
+                @SuppressWarnings({"rawtypes","unchecked"})
                 CtAssignment raw = (CtAssignment) assign;
                 raw.setAssigned((CtExpression) newLhs);
+
+// De-qualify so it prints as: STANDARD_CHARSET_MAP = ...;
+                if (newLhs instanceof CtFieldAccess) {
+                    ((CtFieldAccess<?>) newLhs).setTarget(null);
+                }
+
+
 
             }
         }
